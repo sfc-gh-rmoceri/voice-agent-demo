@@ -96,15 +96,97 @@ Set environment variables for deployed mode (instead of config.json):
 - `SNOWFLAKE_AGENT`
 - `ELEVENLABS_API_KEY`
 
+## Voice Output: Kokoro TTS on Snowpark Container Services
+
+Speech output is served by [Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M)
+running as a container inside your own Snowflake account, via
+[Kokoro-FastAPI](https://github.com/remsky/Kokoro-FastAPI). No third-party TTS
+account, no per-character billing, and the text never leaves Snowflake.
+
+The browser's built-in `speechSynthesis` is the fallback, so the app always
+speaks even when the service is off.
+
+### One-time setup
+
+```bash
+npm run tts:setup    # database, schema, image repo, role, compute pool (ACCOUNTADMIN)
+npm run tts:image    # pull ~5GB image, push to your Snowflake registry
+npm run tts:create   # create the service
+```
+
+### Day-to-day
+
+```bash
+npm run tts:up       # resume the pool before a demo
+npm run tts:status   # check pool and service state
+npm run tts:down     # suspend when finished
+```
+
+You can also use the **Warm up / Shut down** button in the app's voice panel,
+which polls until the service is ready and flips the engine badge from
+`Browser voice` to `Kokoro on SPCS`.
+
+### Cold start is slow — warm up first
+
+Going from suspended to serving takes **several minutes**: node provisioning,
+then a ~5 GB image pull, then model load. This is why the app never blocks on
+a cold service — it checks state first and falls back to browser speech if
+Kokoro is not ready.
+
+Warm it up a few minutes before you demo.
+
+### Cost
+
+| State | Cost |
+|-------|------|
+| Running (`CPU_X64_M`, 6 vCPU) | ~1.1 credits/hr |
+| Suspended | Zero |
+
+The pool auto-suspends after 15 minutes of inactivity (`AUTO_SUSPEND_SECS = 900`),
+and `npm run tts:down` stops it immediately. Compute pools bill only in ACTIVE,
+IDLE, STOPPING and RESIZING states — never SUSPENDED.
+
+To trade cost for latency, switch the pool to a GPU instance family:
+
+```sql
+ALTER COMPUTE POOL VOICE_TTS_POOL SUSPEND;
+ALTER COMPUTE POOL VOICE_TTS_POOL SET INSTANCE_FAMILY = GPU_NV_S;
+ALTER COMPUTE POOL VOICE_TTS_POOL RESUME;
+```
+
+That drops generation to sub-second at roughly 3x the credit rate, and needs
+the GPU image (`ghcr.io/remsky/kokoro-fastapi-gpu`) pushed instead.
+
+### Changing the voice
+
+Kokoro ships several voices and supports blending. Edit the `voice` field in
+[src/routes/api/text-to-speech/+server.ts](src/routes/api/text-to-speech/+server.ts):
+
+```ts
+voice: 'af_heart'          // single voice
+voice: 'af_sky+af_bella'   // weighted blend
+```
+
 ## How It Works
 
 ### Voice Input
 
-1. User clicks the microphone button
-2. `MediaRecorder` captures audio as `audio/webm`
+1. User clicks the orb
+2. `MediaRecorder` captures audio as `audio/webm`, with a live circular waveform
+   driven by the Web Audio API analyser
 3. On stop, the audio blob is sent to `/api/speech-to-text`
 4. Server calls ElevenLabs `speechToText.convert()` with the `scribe_v2` model
 5. Transcribed text is injected into the chat and auto-sent
+
+### Voice Output
+
+1. `/api/tts-status` reports whether the Kokoro service is READY
+2. If ready, `/api/text-to-speech` streams MP3 from the SPCS ingress endpoint,
+   authenticating with a PAT (`Authorization: Snowflake Token="..."`)
+3. Audio is piped through as a `ReadableStream` so playback starts before
+   generation finishes
+4. On any failure the route returns `503 { fallback: true }` and the client
+   uses browser speech synthesis instead
 
 ### Chat
 

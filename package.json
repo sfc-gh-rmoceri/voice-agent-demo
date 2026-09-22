@@ -6,7 +6,13 @@
     "dev": "vite dev",
     "build": "vite build",
     "preview": "vite preview",
-    "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json"
+    "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
+    "tts:setup": "snow sql -c sfsenorthamerica-rmoceri_awse1 -f sql/01_setup.sql",
+    "tts:image": "./scripts/push-image.sh",
+    "tts:create": "snow sql -c sfsenorthamerica-rmoceri_awse1 -f sql/02_service.sql",
+    "tts:up": "snow sql -c sfsenorthamerica-rmoceri_awse1 -f sql/04_resume.sql",
+    "tts:down": "snow sql -c sfsenorthamerica-rmoceri_awse1 -f sql/03_suspend.sql",
+    "tts:status": "snow sql -c sfsenorthamerica-rmoceri_awse1 -q \"SHOW COMPUTE POOLS LIKE 'VOICE_TTS_POOL'; DESCRIBE SERVICE VOICE_DEMO.TTS.KOKORO_TTS\""
   },
   "devDependencies": {
     "@sveltejs/adapter-node": "^5.2.0",

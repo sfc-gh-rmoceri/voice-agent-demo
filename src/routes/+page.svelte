@@ -31,28 +31,149 @@
 	let messages = $state<Message[]>([]);
 	let inputMessage = $state('');
 	let chatLoading = $state(false);
+	let autoSpeak = $state(true);
 
 	// Voice state
 	let isRecording = $state(false);
 	let isTranscribing = $state(false);
+	let isSpeaking = $state(false);
+	let speakingIndex = $state(-1);
 	let mediaRecorder: MediaRecorder | null = null;
 	let audioChunks: Blob[] = [];
 
+	// TTS engine state
+	let ttsState = $state<'READY' | 'STARTING' | 'SUSPENDED' | 'UNAVAILABLE'>('SUSPENDED');
+	let ttsDetail = $state('');
+	let ttsBusy = $state(false);
+	let currentAudio: HTMLAudioElement | null = null;
+	let statusPoll: ReturnType<typeof setInterval> | null = null;
+
+	// Audio analysis for live waveform
+	let audioContext: AudioContext | null = null;
+	let analyser: AnalyserNode | null = null;
+	let animationFrame: number | null = null;
+
 	let chatArea: HTMLDivElement;
+	let waveCanvas: HTMLCanvasElement;
 	let vegaEmbedModule: typeof import('vega-embed') | null = null;
+
+	const orbState = $derived(
+		isRecording ? 'recording' : isSpeaking ? 'speaking' : chatLoading ? 'thinking' : 'idle'
+	);
+
+	const orbIcon = $derived(
+		isRecording ? '\u23F9' : isSpeaking ? '\u{1F50A}' : isTranscribing ? '\u231B' : '\u{1F3A4}'
+	);
+
+	const statusLabel = $derived(
+		isRecording
+			? 'Listening...'
+			: isTranscribing
+				? 'Transcribing...'
+				: isSpeaking
+					? 'Speaking'
+					: chatLoading
+						? 'Thinking...'
+						: 'Ready'
+	);
+
+	const statusHint = $derived(
+		isRecording
+			? 'Tap the orb to stop and send'
+			: isSpeaking
+				? 'Tap to stop playback'
+				: chatLoading
+					? 'Querying 600M+ retail records'
+					: 'Tap the orb to speak, or type below'
+	);
 
 	onMount(async () => {
 		vegaEmbedModule = await import('vega-embed');
 		const mermaidMod = await import('mermaid');
-		mermaidMod.default.initialize({ startOnLoad: false, theme: 'neutral' });
+		mermaidMod.default.initialize({ startOnLoad: false, theme: 'dark' });
+		// Warm up voice list
+		window.speechSynthesis.getVoices();
+		refreshTtsStatus();
 	});
 
 	function scrollToBottom() {
-		if (chatArea) {
-			chatArea.scrollTop = chatArea.scrollHeight;
+		if (chatArea) chatArea.scrollTop = chatArea.scrollHeight;
+	}
+
+	// ============ Live waveform ============
+	function drawWaveform() {
+		if (!waveCanvas || !analyser) return;
+		const ctx = waveCanvas.getContext('2d');
+		if (!ctx) return;
+
+		const dpr = window.devicePixelRatio || 1;
+		const w = waveCanvas.clientWidth;
+		const h = waveCanvas.clientHeight;
+		if (waveCanvas.width !== w * dpr) {
+			waveCanvas.width = w * dpr;
+			waveCanvas.height = h * dpr;
+			ctx.scale(dpr, dpr);
+		}
+
+		const bufferLength = analyser.frequencyBinCount;
+		const data = new Uint8Array(bufferLength);
+
+		const render = () => {
+			if (!analyser) return;
+			animationFrame = requestAnimationFrame(render);
+			analyser.getByteFrequencyData(data);
+
+			ctx.clearRect(0, 0, w, h);
+
+			const cx = w / 2;
+			const cy = h / 2;
+			const baseRadius = 78;
+			const bars = 72;
+
+			for (let i = 0; i < bars; i++) {
+				const dataIdx = Math.floor((i / bars) * (bufferLength * 0.6));
+				const amplitude = (data[dataIdx] / 255) * 42;
+				const angle = (i / bars) * Math.PI * 2 - Math.PI / 2;
+
+				const x1 = cx + Math.cos(angle) * baseRadius;
+				const y1 = cy + Math.sin(angle) * baseRadius;
+				const x2 = cx + Math.cos(angle) * (baseRadius + amplitude);
+				const y2 = cy + Math.sin(angle) * (baseRadius + amplitude);
+
+				const intensity = data[dataIdx] / 255;
+				const grad = ctx.createLinearGradient(x1, y1, x2, y2);
+				grad.addColorStop(0, `rgba(212, 91, 144, ${0.3 + intensity * 0.7})`);
+				grad.addColorStop(1, `rgba(255, 159, 54, ${intensity * 0.9})`);
+
+				ctx.strokeStyle = grad;
+				ctx.lineWidth = 2.5;
+				ctx.lineCap = 'round';
+				ctx.beginPath();
+				ctx.moveTo(x1, y1);
+				ctx.lineTo(x2, y2);
+				ctx.stroke();
+			}
+		};
+		render();
+	}
+
+	function stopWaveform() {
+		if (animationFrame) {
+			cancelAnimationFrame(animationFrame);
+			animationFrame = null;
+		}
+		if (waveCanvas) {
+			const ctx = waveCanvas.getContext('2d');
+			ctx?.clearRect(0, 0, waveCanvas.width, waveCanvas.height);
+		}
+		analyser = null;
+		if (audioContext) {
+			audioContext.close();
+			audioContext = null;
 		}
 	}
 
+	// ============ Rendering ============
 	async function renderMermaid() {
 		const mermaidMod = await import('mermaid');
 		await tick();
@@ -64,7 +185,7 @@
 				block.innerHTML = svg;
 				block.setAttribute('data-processed', 'true');
 			} catch {
-				// leave original text if mermaid can't render
+				/* leave as-is */
 			}
 		}
 	}
@@ -78,10 +199,15 @@
 			if (!specStr) continue;
 			try {
 				const spec = JSON.parse(specStr);
-				await vegaEmbedModule.default(el as HTMLElement, spec, {
-					actions: false,
-					renderer: 'svg'
-				});
+				spec.background = 'transparent';
+				spec.config = {
+					...(spec.config || {}),
+					axis: { labelColor: '#7A8B9C', titleColor: '#7A8B9C', gridColor: 'rgba(41,181,232,0.08)', domainColor: 'rgba(41,181,232,0.2)' },
+					legend: { labelColor: '#7A8B9C', titleColor: '#7A8B9C' },
+					range: { category: ['#29B5E8', '#75CDD7', '#7D44CF', '#FF9F36', '#D45B90', '#11567F'] },
+					view: { stroke: 'transparent' }
+				};
+				await vegaEmbedModule.default(el as HTMLElement, spec, { actions: false, renderer: 'svg' });
 				el.setAttribute('data-rendered', 'true');
 			} catch {
 				el.textContent = 'Failed to render chart';
@@ -89,25 +215,25 @@
 		}
 	}
 
+	// ============ Chat ============
 	async function sendMessage(text?: string) {
 		const msg = text || inputMessage.trim();
 		if (!msg || chatLoading) return;
 
+		if (isSpeaking) stopSpeaking();
 		inputMessage = '';
 		chatLoading = true;
 
-		// Add user message
 		messages = [
 			...messages,
 			{ role: 'user', content: msg, html: '', status: '', charts: [], tables: [], suggestedQueries: [] }
 		];
-
-		// Add assistant placeholder and grab the proxy ref
 		messages = [
 			...messages,
-			{ role: 'assistant', content: '', html: '', status: 'Connecting...', charts: [], tables: [], suggestedQueries: [] }
+			{ role: 'assistant', content: '', html: '', status: 'Connecting', charts: [], tables: [], suggestedQueries: [] }
 		];
 		const assistantMsg = messages[messages.length - 1];
+		const assistantIdx = messages.length - 1;
 
 		await tick();
 		scrollToBottom();
@@ -164,14 +290,11 @@
 						try {
 							const data = JSON.parse(dataStr);
 
-							// Status events
-							if (data.status === 'planning') assistantMsg.status = 'Planning...';
+							if (data.status === 'planning') assistantMsg.status = 'Planning query';
 							if (data.status === 'executing_tool')
-								assistantMsg.status = `Running ${data.tool_type || 'tool'}...`;
-							if (data.status === 'proceeding_to_answer')
-								assistantMsg.status = 'Generating response...';
+								assistantMsg.status = `Running ${data.tool_type || 'analysis'}`;
+							if (data.status === 'proceeding_to_answer') assistantMsg.status = 'Composing answer';
 
-							// Text deltas
 							if (currentEvent === 'response.text.delta' && data.text) {
 								collectedText += data.text;
 								assistantMsg.content = collectedText;
@@ -181,7 +304,6 @@
 								scrollToBottom();
 							}
 
-							// Chart events
 							if (currentEvent === 'response.chart' && data.chart_spec) {
 								const key = data.tool_use_id || data.chart_spec;
 								if (!seenChartIds.has(key)) {
@@ -193,39 +315,28 @@
 								}
 							}
 
-							// Table events
 							if (currentEvent === 'response.table' && data.result_set) {
 								const key = data.tool_use_id || JSON.stringify(data.result_set.data?.[0]);
 								if (!seenTableIds.has(key)) {
 									seenTableIds.add(key);
 									assistantMsg.tables = [
 										...assistantMsg.tables,
-										{
-											title: data.title,
-											tool_use_id: data.tool_use_id,
-											result_set: data.result_set
-										}
+										{ title: data.title, tool_use_id: data.tool_use_id, result_set: data.result_set }
 									];
 								}
 							}
 
-							// Final assembled response
 							if (currentEvent === 'response' && data.content) {
 								let lastText = '';
 								for (const item of data.content) {
-									if (item.type === 'text' && item.text?.trim()) {
-										lastText = item.text;
-									}
+									if (item.type === 'text' && item.text?.trim()) lastText = item.text;
 									if (item.type === 'chart' && item.chart?.chart_spec) {
 										const key = item.chart.tool_use_id || item.chart.chart_spec;
 										if (!seenChartIds.has(key)) {
 											seenChartIds.add(key);
 											assistantMsg.charts = [
 												...assistantMsg.charts,
-												{
-													tool_use_id: item.chart.tool_use_id,
-													chart_spec: item.chart.chart_spec
-												}
+												{ tool_use_id: item.chart.tool_use_id, chart_spec: item.chart.chart_spec }
 											];
 										}
 									}
@@ -242,7 +353,7 @@
 								}
 							}
 						} catch {
-							// partial JSON — ignore
+							/* partial JSON */
 						}
 					}
 				}
@@ -258,6 +369,10 @@
 			await renderMermaid();
 			await renderCharts();
 			scrollToBottom();
+
+			if (autoSpeak && assistantMsg.content) {
+				speakText(assistantMsg.content, assistantIdx);
+			}
 		} catch (err) {
 			assistantMsg.content = `Error: ${err instanceof Error ? err.message : 'Network error'}`;
 			assistantMsg.html = assistantMsg.content;
@@ -267,10 +382,19 @@
 		}
 	}
 
-	// Voice recording
+	// ============ Recording ============
 	async function startRecording() {
 		try {
 			const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+
+			// Set up live audio analysis
+			audioContext = new AudioContext();
+			const source = audioContext.createMediaStreamSource(stream);
+			analyser = audioContext.createAnalyser();
+			analyser.fftSize = 256;
+			analyser.smoothingTimeConstant = 0.7;
+			source.connect(analyser);
+
 			mediaRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm' });
 			audioChunks = [];
 
@@ -279,14 +403,17 @@
 			};
 
 			mediaRecorder.onstop = async () => {
-				stream.getTracks().forEach((track) => track.stop());
+				stream.getTracks().forEach((t) => t.stop());
+				stopWaveform();
 				await processRecording();
 			};
 
 			mediaRecorder.start();
 			isRecording = true;
+			await tick();
+			drawWaveform();
 		} catch {
-			// mic permission denied or unavailable
+			stopWaveform();
 		}
 	}
 
@@ -306,19 +433,183 @@
 		formData.append('audio', audioBlob, 'recording.webm');
 
 		try {
-			const response = await fetch('/api/speech-to-text', {
-				method: 'POST',
-				body: formData
-			});
-
+			const response = await fetch('/api/speech-to-text', { method: 'POST', body: formData });
 			const data = await response.json();
-			if (data.text) {
-				await sendMessage(data.text);
-			}
+			if (data.text) await sendMessage(data.text);
 		} catch {
-			// transcription failed silently
+			/* silent */
 		} finally {
 			isTranscribing = false;
+		}
+	}
+
+	// ============ Speech synthesis ============
+	function stopSpeaking() {
+		window.speechSynthesis.cancel();
+		if (currentAudio) {
+			currentAudio.pause();
+			currentAudio = null;
+		}
+		isSpeaking = false;
+		speakingIndex = -1;
+	}
+
+	function cleanForSpeech(text: string): string {
+		return text
+			.replace(/```[\s\S]*?```/g, '')
+			.replace(/[#*_`|>]/g, '')
+			.replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
+			.replace(/\n+/g, '. ')
+			.replace(/\s+/g, ' ')
+			.slice(0, 3000);
+	}
+
+	/** Browser speech synthesis — the always-available fallback. */
+	function speakWithBrowser(cleaned: string, index: number) {
+		const utterance = new SpeechSynthesisUtterance(cleaned);
+		utterance.rate = 1.05;
+		utterance.pitch = 1.0;
+
+		const voices = window.speechSynthesis.getVoices();
+		const preferred =
+			voices.find((v) => v.name.includes('Samantha')) ||
+			voices.find((v) => v.name.includes('Karen')) ||
+			voices.find((v) => v.name.includes('Google US English')) ||
+			voices.find((v) => v.lang.startsWith('en') && v.localService);
+		if (preferred) utterance.voice = preferred;
+
+		utterance.onend = () => {
+			isSpeaking = false;
+			speakingIndex = -1;
+		};
+		utterance.onerror = () => {
+			isSpeaking = false;
+			speakingIndex = -1;
+		};
+
+		isSpeaking = true;
+		speakingIndex = index;
+		window.speechSynthesis.speak(utterance);
+	}
+
+	/**
+	 * Try Kokoro on SPCS first; fall back to browser speech if the service is
+	 * cold, suspended, or errors. The app always speaks — quality just improves
+	 * when Kokoro is warm.
+	 */
+	async function speakText(text: string, index: number) {
+		if (isSpeaking) {
+			const wasSame = speakingIndex === index;
+			stopSpeaking();
+			if (wasSame) return;
+		}
+
+		const cleaned = cleanForSpeech(text);
+		if (!cleaned.trim()) return;
+
+		if (ttsState !== 'READY') {
+			speakWithBrowser(cleaned, index);
+			return;
+		}
+
+		isSpeaking = true;
+		speakingIndex = index;
+
+		try {
+			const response = await fetch('/api/text-to-speech', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ text: cleaned })
+			});
+
+			if (!response.ok) {
+				// Service went cold between the status check and now.
+				const body = await response.json().catch(() => ({}));
+				if (body.state) {
+					ttsState = body.state;
+					ttsDetail = body.detail || '';
+				}
+				isSpeaking = false;
+				speakingIndex = -1;
+				speakWithBrowser(cleaned, index);
+				return;
+			}
+
+			const blob = await response.blob();
+			const url = URL.createObjectURL(blob);
+			currentAudio = new Audio(url);
+			currentAudio.onended = () => {
+				isSpeaking = false;
+				speakingIndex = -1;
+				currentAudio = null;
+				URL.revokeObjectURL(url);
+			};
+			currentAudio.onerror = () => {
+				isSpeaking = false;
+				speakingIndex = -1;
+				currentAudio = null;
+				URL.revokeObjectURL(url);
+			};
+			await currentAudio.play();
+		} catch {
+			isSpeaking = false;
+			speakingIndex = -1;
+			speakWithBrowser(cleaned, index);
+		}
+	}
+
+	// ============ TTS service lifecycle ============
+	async function refreshTtsStatus() {
+		try {
+			const res = await fetch('/api/tts-status');
+			const data = await res.json();
+			ttsState = data.state;
+			ttsDetail = data.detail || '';
+
+			// Stop polling once we reach a settled state.
+			if ((ttsState === 'READY' || ttsState === 'UNAVAILABLE') && statusPoll) {
+				clearInterval(statusPoll);
+				statusPoll = null;
+				ttsBusy = false;
+			}
+		} catch {
+			ttsState = 'UNAVAILABLE';
+		}
+	}
+
+	async function toggleTtsService() {
+		const action = ttsState === 'SUSPENDED' ? 'resume' : 'suspend';
+		ttsBusy = true;
+
+		try {
+			const res = await fetch('/api/tts-status', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ action })
+			});
+			const data = await res.json();
+			ttsState = data.state ?? ttsState;
+			ttsDetail = data.detail ?? '';
+
+			if (action === 'resume') {
+				// Cold start is several minutes; poll until ready.
+				if (statusPoll) clearInterval(statusPoll);
+				statusPoll = setInterval(refreshTtsStatus, 10000);
+			} else {
+				ttsBusy = false;
+			}
+		} catch {
+			ttsBusy = false;
+		}
+	}
+
+	function handleOrbClick() {
+		if (isSpeaking) {
+			stopSpeaking();
+		} else if (isRecording) {
+			stopRecording();
+		} else if (!chatLoading && !isTranscribing) {
+			startRecording();
 		}
 	}
 
@@ -331,119 +622,206 @@
 </script>
 
 <svelte:head>
-	<title>Voice Agent Demo</title>
+	<title>Voice Agent — Retail Analytics</title>
+	<link rel="preconnect" href="https://fonts.googleapis.com" />
+	<link
+		href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap"
+		rel="stylesheet"
+	/>
 </svelte:head>
 
 <div class="app-container">
-	<header class="app-header">
-		<svg width="24" height="24" viewBox="0 0 24 24" fill="none">
-			<path
-				d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"
-				stroke="#29B5E8"
-				stroke-width="2"
-				stroke-linecap="round"
-				stroke-linejoin="round"
-			/>
-		</svg>
-		<h1>Voice Agent Demo</h1>
-		<span class="badge">Retail Analytics</span>
-	</header>
-
-	<div class="chat-area" bind:this={chatArea}>
-		{#if messages.length === 0}
-			<div class="welcome">
-				<h2>Talk to your data</h2>
-				<p>Ask questions by typing or recording your voice. Powered by Snowflake Cortex Agent and ElevenLabs Scribe.</p>
-				<div class="suggested-queries">
-					<button onclick={() => sendMessage('What are the top 10 products by revenue?')}>Top products by revenue</button>
-					<button onclick={() => sendMessage('Show me monthly sales trends')}>Monthly sales trends</button>
-					<button onclick={() => sendMessage('Which dealers have the highest volume?')}>Top dealers by volume</button>
-				</div>
+	<!-- LEFT: Conversation -->
+	<div class="conversation-pane">
+		<header class="app-header">
+			<div class="logo-mark">
+				<svg width="18" height="18" viewBox="0 0 24 24" fill="none">
+					<path
+						d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"
+						stroke="#fff"
+						stroke-width="2"
+						stroke-linecap="round"
+						stroke-linejoin="round"
+					/>
+				</svg>
 			</div>
-		{/if}
+			<div class="header-text">
+				<h1>Voice Agent</h1>
+				<div class="subtitle">Retail Analytics &middot; 600M Records</div>
+			</div>
+			<div class="header-status">
+				<span class="status-dot"></span>
+				Cortex Agent
+			</div>
+		</header>
 
-		{#each messages as msg}
-			<div class="message {msg.role}">
-				{#if msg.status}
-					<div class="status-indicator">{msg.status}</div>
-				{/if}
-
-				{#if msg.role === 'user'}
-					{msg.content}
-				{:else}
-					<div class="message-content">
-						{@html msg.html}
+		<div class="chat-area" bind:this={chatArea}>
+			{#if messages.length === 0}
+				<div class="welcome">
+					<h2>Talk to your data</h2>
+					<p>
+						Ask anything about retail sales, products, customers, or dealers. Speak or type &mdash;
+						answers come back with charts, tables, and voice.
+					</p>
+					<div class="chips">
+						<button class="chip" onclick={() => sendMessage('What is total revenue by region?')}>
+							Revenue by region
+						</button>
+						<button class="chip" onclick={() => sendMessage('What are the top product categories by revenue?')}>
+							Top categories
+						</button>
+						<button class="chip" onclick={() => sendMessage('Show me monthly revenue trends')}>
+							Monthly trends
+						</button>
 					</div>
+				</div>
+			{/if}
 
-					{#if msg.charts.length > 0}
-						{#each msg.charts as chart}
-							<div class="vega-chart" data-spec={chart.chart_spec}></div>
-						{/each}
-					{/if}
+			{#each messages as msg, i}
+				<div class="message {msg.role}" class:speaking={speakingIndex === i}>
+					<div class="message-label">{msg.role === 'user' ? 'You' : 'Agent'}</div>
 
-					{#if msg.tables.length > 0}
-						{#each msg.tables as table}
-							{#if table.title}
-								<strong>{table.title}</strong>
+					{#if msg.role === 'user'}
+						<div class="bubble">{msg.content}</div>
+					{:else}
+						<div class="bubble">
+							{#if msg.status}
+								<div class="status-indicator">
+									<span class="spinner"></span>
+									{msg.status}
+								</div>
 							{/if}
-							<table class="result-table">
-								<thead>
-									<tr>
-										{#each table.result_set.resultSetMetaData.rowType as col}
-											<th>{col.name}</th>
-										{/each}
-									</tr>
-								</thead>
-								<tbody>
-									{#each table.result_set.data as row}
-										<tr>
-											{#each row as cell}
-												<td>{cell ?? ''}</td>
-											{/each}
-										</tr>
-									{/each}
-								</tbody>
-							</table>
-						{/each}
-					{/if}
 
-					{#if msg.suggestedQueries.length > 0}
-						<div class="suggested-queries">
-							{#each msg.suggestedQueries as q}
-								<button onclick={() => sendMessage(q)}>{q}</button>
-							{/each}
+							{#if msg.html}
+								{@html msg.html}
+							{/if}
+
+							{#if msg.charts.length > 0}
+								{#each msg.charts as chart}
+									<div class="vega-chart" data-spec={chart.chart_spec}></div>
+								{/each}
+							{/if}
+
+							{#if msg.tables.length > 0}
+								{#each msg.tables as table}
+									<table class="result-table">
+										<thead>
+											<tr>
+												{#each table.result_set.resultSetMetaData.rowType as col}
+													<th>{col.name}</th>
+												{/each}
+											</tr>
+										</thead>
+										<tbody>
+											{#each table.result_set.data as row}
+												<tr>
+													{#each row as cell}
+														<td>{cell ?? ''}</td>
+													{/each}
+												</tr>
+											{/each}
+										</tbody>
+									</table>
+								{/each}
+							{/if}
+
+							{#if msg.suggestedQueries.length > 0}
+								<div class="chips">
+									{#each msg.suggestedQueries as q}
+										<button class="chip" onclick={() => sendMessage(q)}>{q}</button>
+									{/each}
+								</div>
+							{/if}
 						</div>
+
+						{#if msg.content && !msg.status}
+							<button
+								class="btn-speak"
+								class:active={speakingIndex === i}
+								onclick={() => speakText(msg.content, i)}
+							>
+								{speakingIndex === i ? '\u23F9 Stop' : '\u{1F50A} Listen'}
+							</button>
+						{/if}
 					{/if}
-				{/if}
-			</div>
-		{/each}
+				</div>
+			{/each}
+		</div>
 	</div>
 
-	<div class="input-area">
-		<button
-			class="btn btn-mic"
-			class:recording={isRecording}
-			onclick={isRecording ? stopRecording : startRecording}
-			disabled={chatLoading || isTranscribing}
-			title={isRecording ? 'Stop recording' : 'Record voice message'}
-		>
-			{#if isTranscribing}
-				&#8987;
-			{:else if isRecording}
-				&#9632;
-			{:else}
-				&#127908;
+	<!-- RIGHT: Voice orb -->
+	<div class="voice-pane">
+		<div class="orb-wrap" class:active={orbState !== 'idle'}>
+			<div class="orb-ring r1"></div>
+			<div class="orb-ring r2"></div>
+			<div class="orb-ring r3"></div>
+
+			<canvas class="waveform" bind:this={waveCanvas}></canvas>
+
+			<button
+				class="orb-core {orbState}"
+				onclick={handleOrbClick}
+				title={isRecording ? 'Stop and send' : isSpeaking ? 'Stop playback' : 'Start recording'}
+			>
+				{#if isSpeaking}
+					<div class="voice-bars">
+						<span></span><span></span><span></span><span></span><span></span><span></span><span></span>
+					</div>
+				{:else}
+					<span class="orb-icon">{orbIcon}</span>
+				{/if}
+			</button>
+		</div>
+
+		<div class="voice-status">
+			<div class="label">{statusLabel}</div>
+			<div class="hint">{statusHint}</div>
+		</div>
+
+		<div class="input-row">
+			<textarea
+				bind:value={inputMessage}
+				onkeydown={handleKeydown}
+				placeholder="Or type a question..."
+				disabled={chatLoading || isRecording || isTranscribing}
+				rows="2"
+			></textarea>
+			<button class="btn-send" onclick={() => sendMessage()} disabled={chatLoading || !inputMessage.trim()}>
+				Send
+			</button>
+		</div>
+
+		<button class="autospeak" onclick={() => (autoSpeak = !autoSpeak)}>
+			<span class="toggle" class:on={autoSpeak}></span>
+			Auto-speak responses
+		</button>
+
+		<div class="tts-panel">
+			<div class="tts-row">
+				<span class="engine-badge" class:live={ttsState === 'READY'}>
+					{ttsState === 'READY' ? 'Kokoro on SPCS' : 'Browser voice'}
+				</span>
+				<button
+					class="btn-tts"
+					onclick={toggleTtsService}
+					disabled={ttsBusy || ttsState === 'UNAVAILABLE'}
+				>
+					{#if ttsBusy}
+						Starting...
+					{:else if ttsState === 'SUSPENDED'}
+						Warm up
+					{:else if ttsState === 'READY'}
+						Shut down
+					{:else}
+						{ttsState}
+					{/if}
+				</button>
+			</div>
+			{#if ttsDetail}
+				<div class="tts-detail">
+					{ttsDetail}{ttsBusy ? ' — cold start takes a few minutes' : ''}
+				</div>
 			{/if}
-		</button>
-		<textarea
-			bind:value={inputMessage}
-			onkeydown={handleKeydown}
-			placeholder={isRecording ? 'Recording...' : isTranscribing ? 'Transcribing...' : 'Ask a question...'}
-			disabled={chatLoading || isRecording || isTranscribing}
-			rows="1"
-		></textarea>
-		<button class="btn btn-send" onclick={() => sendMessage()} disabled={chatLoading || !inputMessage.trim()}>
-			Send
-		</button>
+		</div>
 	</div>
 </div>
