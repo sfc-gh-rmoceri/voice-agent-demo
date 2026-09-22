@@ -146,6 +146,11 @@ The pool auto-suspends after 15 minutes of inactivity (`AUTO_SUSPEND_SECS = 900`
 and `npm run tts:down` stops it immediately. Compute pools bill only in ACTIVE,
 IDLE, STOPPING and RESIZING states — never SUSPENDED.
 
+> **Important:** `AUTO_SUSPEND_SECS` measures *no services and no jobs running*
+> on the pool. A running service counts as activity, so the pool will **not**
+> auto-suspend while `KOKORO_TTS` is up. Always run `npm run tts:down` (or use
+> the Shut down button) when you finish — otherwise it bills indefinitely.
+
 To trade cost for latency, switch the pool to a GPU instance family:
 
 ```sql
