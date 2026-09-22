@@ -1,0 +1,14 @@
+install:
+  commands:
+    - ["npm", "ci", "--include=dev"]
+build:
+  commands:
+    - ["npm", "run", "build"]
+run:
+  command: ["node", "build/index.js"]
+  env:
+    PORT: "8080"
+profile:
+  label: "Voice Agent Demo"
+  description: "Talk to a Snowflake Cortex Agent with voice or text"
+  icon: "SparklesAgentIcon"
