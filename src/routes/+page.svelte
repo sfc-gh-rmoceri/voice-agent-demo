@@ -94,6 +94,11 @@
 		// Warm up voice list
 		window.speechSynthesis.getVoices();
 		refreshTtsStatus();
+
+		// Keep the engine badge honest — the service can come up or go down
+		// outside the app (npm run tts:up / tts:down, auto-suspend).
+		const bgPoll = setInterval(refreshTtsStatus, 30000);
+		return () => clearInterval(bgPoll);
 	});
 
 	function scrollToBottom() {
@@ -506,6 +511,12 @@
 
 		const cleaned = cleanForSpeech(text);
 		if (!cleaned.trim()) return;
+
+		// Status is cached, and the service may have come up (or gone down)
+		// since the last check. Re-verify rather than trusting stale state.
+		if (ttsState !== 'READY') {
+			await refreshTtsStatus();
+		}
 
 		if (ttsState !== 'READY') {
 			speakWithBrowser(cleaned, index);
