@@ -476,6 +476,29 @@ body::before {
 	line-height: 1.5;
 }
 
+.auto-stop {
+	display: inline-flex;
+	align-items: center;
+	gap: 6px;
+	margin-top: 10px;
+	font-size: 11px;
+	color: var(--text-dim);
+	cursor: pointer;
+	user-select: none;
+}
+
+.auto-stop input {
+	accent-color: var(--accent, #29b5e8);
+	width: 13px;
+	height: 13px;
+	cursor: pointer;
+}
+
+.auto-stop input:disabled {
+	cursor: default;
+	opacity: 0.5;
+}
+
 /* Input row */
 .input-row {
 	width: 100%;

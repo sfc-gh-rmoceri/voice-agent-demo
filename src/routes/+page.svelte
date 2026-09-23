@@ -40,6 +40,7 @@
 	let speakingIndex = $state(-1);
 	let mediaRecorder: MediaRecorder | null = null;
 	let audioChunks: Blob[] = [];
+	let discardTake = false;
 
 	// TTS engine state
 	let ttsState = $state<'READY' | 'STARTING' | 'SUSPENDED' | 'UNAVAILABLE'>('SUSPENDED');
@@ -52,6 +53,19 @@
 	let audioContext: AudioContext | null = null;
 	let analyser: AnalyserNode | null = null;
 	let animationFrame: number | null = null;
+
+	// Voice activity detection — stop recording on a natural pause instead of
+	// making the user click the mic a second time.
+	let autoStop = $state(true);
+	let heardSpeech = $state(false);
+	let vadFrame: number | null = null;
+
+	/** Pause after speech that ends the turn. */
+	const SILENCE_MS = 1300;
+	/** Give up if the user never says anything. */
+	const NO_SPEECH_TIMEOUT_MS = 8000;
+	/** Absolute cap so a stuck mic cannot record forever. */
+	const MAX_RECORDING_MS = 30000;
 
 	let chatArea: HTMLDivElement;
 	let waveCanvas: HTMLCanvasElement;
@@ -79,7 +93,11 @@
 
 	const statusHint = $derived(
 		isRecording
-			? 'Tap the orb to stop and send'
+			? autoStop
+				? heardSpeech
+					? 'Listening — pause when you\u2019re done'
+					: 'Go ahead, I\u2019m listening'
+				: 'Tap the orb to stop and send'
 			: isSpeaking
 				? 'Tap to stop playback'
 				: chatLoading
@@ -171,6 +189,10 @@
 		if (animationFrame) {
 			cancelAnimationFrame(animationFrame);
 			animationFrame = null;
+		}
+		if (vadFrame) {
+			cancelAnimationFrame(vadFrame);
+			vadFrame = null;
 		}
 		if (waveCanvas) {
 			const ctx = waveCanvas.getContext('2d');
@@ -393,9 +415,86 @@
 	}
 
 	// ============ Recording ============
+	/**
+	 * Watch the mic level and end the turn on a natural pause.
+	 *
+	 * Rooms differ, so rather than hard-coding a threshold we measure the
+	 * ambient floor for the first moment of the recording and trigger on a
+	 * multiple of it. Silence only counts once we have actually heard speech,
+	 * otherwise we would cut off before the user starts talking.
+	 */
+	function monitorSilence() {
+		if (!analyser) return;
+
+		const samples = new Uint8Array(analyser.fftSize);
+		const startedAt = performance.now();
+		let noiseFloor = 0;
+		let calibrationFrames = 0;
+		let silenceSince: number | null = null;
+
+		const tick = () => {
+			if (!analyser || !isRecording) return;
+			vadFrame = requestAnimationFrame(tick);
+
+			analyser.getByteTimeDomainData(samples);
+
+			// RMS deviation from the 128 midpoint = how loud the input is.
+			let sum = 0;
+			for (let i = 0; i < samples.length; i++) {
+				const v = (samples[i] - 128) / 128;
+				sum += v * v;
+			}
+			const level = Math.sqrt(sum / samples.length);
+			const elapsed = performance.now() - startedAt;
+
+			// First ~400ms establishes the room's baseline.
+			if (elapsed < 400) {
+				noiseFloor = (noiseFloor * calibrationFrames + level) / (calibrationFrames + 1);
+				calibrationFrames++;
+				return;
+			}
+
+			// Cap the floor: if the user started talking during calibration we
+			// would otherwise measure their voice as "ambient" and set a
+			// threshold so high that nothing ever registers as speech.
+			const threshold = Math.min(Math.max(noiseFloor * 3, 0.02), 0.09);
+
+			if (level > threshold) {
+				heardSpeech = true;
+				silenceSince = null;
+			} else if (heardSpeech) {
+				silenceSince ??= performance.now();
+				if (performance.now() - silenceSince >= SILENCE_MS) {
+					stopRecording();
+					return;
+				}
+			}
+
+			// Bail out if they never spoke, and hard-cap total length.
+			if (!heardSpeech && elapsed > NO_SPEECH_TIMEOUT_MS) {
+				cancelRecording();
+				return;
+			}
+			if (elapsed > MAX_RECORDING_MS) {
+				stopRecording();
+			}
+		};
+
+		tick();
+	}
+
 	async function startRecording() {
 		try {
-			const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+			// Don't record the assistant talking back to us.
+			stopSpeaking();
+
+			const stream = await navigator.mediaDevices.getUserMedia({
+				audio: {
+					echoCancellation: true,
+					noiseSuppression: true,
+					autoGainControl: true
+				}
+			});
 
 			// Set up live audio analysis
 			audioContext = new AudioContext();
@@ -407,6 +506,7 @@
 
 			mediaRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm' });
 			audioChunks = [];
+			discardTake = false;
 
 			mediaRecorder.ondataavailable = (event) => {
 				if (event.data.size > 0) audioChunks.push(event.data);
@@ -415,13 +515,20 @@
 			mediaRecorder.onstop = async () => {
 				stream.getTracks().forEach((t) => t.stop());
 				stopWaveform();
+				// A silent take has nothing worth sending to the transcriber.
+				if (discardTake) {
+					audioChunks = [];
+					return;
+				}
 				await processRecording();
 			};
 
 			mediaRecorder.start();
 			isRecording = true;
+			heardSpeech = false;
 			await tick();
 			drawWaveform();
+			if (autoStop) monitorSilence();
 		} catch {
 			stopWaveform();
 		}
@@ -429,8 +536,17 @@
 
 	function stopRecording() {
 		if (mediaRecorder && isRecording) {
-			mediaRecorder.stop();
 			isRecording = false;
+			mediaRecorder.stop();
+		}
+	}
+
+	/** Discard the take without transcribing it. */
+	function cancelRecording() {
+		if (mediaRecorder && isRecording) {
+			discardTake = true;
+			isRecording = false;
+			mediaRecorder.stop();
 		}
 	}
 
@@ -850,6 +966,10 @@
 		<div class="voice-status">
 			<div class="label">{statusLabel}</div>
 			<div class="hint">{statusHint}</div>
+			<label class="auto-stop" title="End the turn automatically on a pause">
+				<input type="checkbox" bind:checked={autoStop} disabled={isRecording} />
+				<span>Auto-stop on silence</span>
+			</label>
 		</div>
 
 		<div class="input-row">
