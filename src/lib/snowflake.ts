@@ -119,6 +119,11 @@ export async function getTtsState(): Promise<{ state: TtsState; detail: string }
 				? { state: 'READY', detail: 'Kokoro ready' }
 				: { state: 'STARTING', detail: 'Endpoint provisioning' };
 		}
+		// A suspended service on a live pool will not start on its own.
+		if (status === 'SUSPENDED') {
+			await ensureServiceResumed();
+			return { state: 'STARTING', detail: 'Starting container' };
+		}
 		return { state: 'STARTING', detail: `Service ${status.toLowerCase() || 'starting'}` };
 	} catch {
 		return { state: 'UNAVAILABLE', detail: 'Service not created' };
@@ -126,7 +131,27 @@ export async function getTtsState(): Promise<{ state: TtsState; detail: string }
 }
 
 export async function resumeTts(): Promise<void> {
+	// Resuming the pool does not resume its services — suspending a pool
+	// suspends them, and they must be brought back explicitly.
 	await querySnowflake(`ALTER COMPUTE POOL ${POOL} RESUME`, ROLE);
+	try {
+		await querySnowflake(`ALTER SERVICE ${SERVICE} RESUME`, ROLE);
+	} catch {
+		// The service cannot resume until the pool has a node; the status
+		// poller will retry via ensureServiceResumed().
+	}
+}
+
+/**
+ * Called from the status poller: if the pool has capacity but the service is
+ * still suspended, nudge it. Safe to call repeatedly.
+ */
+export async function ensureServiceResumed(): Promise<void> {
+	try {
+		await querySnowflake(`ALTER SERVICE ${SERVICE} RESUME`, ROLE);
+	} catch {
+		// already running, or pool not ready yet
+	}
 }
 
 export async function suspendTts(): Promise<void> {
