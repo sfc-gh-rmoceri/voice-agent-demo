@@ -84,13 +84,33 @@ export async function getIngressUrl(): Promise<string | null> {
 }
 
 /**
+ * A READY verdict costs two SQL round-trips (~5s), which is pure dead air in
+ * front of every spoken response. Once we know the service is up, trust that
+ * for a short window. Only READY is cached: any other state stays live so a
+ * service coming back reflects immediately, and a service that dies mid-window
+ * surfaces as a stream error the client falls back from.
+ */
+let readyUntil = 0;
+const READY_TTL_MS = 60_000;
+
+export async function getTtsState(): Promise<{ state: TtsState; detail: string }> {
+	if (Date.now() < readyUntil) {
+		return { state: 'READY', detail: 'Kokoro ready' };
+	}
+
+	const result = await resolveTtsState();
+	readyUntil = result.state === 'READY' ? Date.now() + READY_TTL_MS : 0;
+	return result;
+}
+
+/**
  * Report whether the TTS service can serve a request right now.
  *
  * A suspended pool takes several minutes to come back (node provisioning,
  * image pull, model load), so callers should treat anything other than READY
  * as "fall back to browser speech" rather than something to wait on.
  */
-export async function getTtsState(): Promise<{ state: TtsState; detail: string }> {
+async function resolveTtsState(): Promise<{ state: TtsState; detail: string }> {
 	let poolState = '';
 	try {
 		const pools = await querySnowflake(`SHOW COMPUTE POOLS LIKE '${POOL}'`, ROLE);
@@ -157,4 +177,5 @@ export async function ensureServiceResumed(): Promise<void> {
 export async function suspendTts(): Promise<void> {
 	await querySnowflake(`ALTER COMPUTE POOL ${POOL} SUSPEND`, ROLE);
 	cachedIngressUrl = null;
+	readyUntil = 0;
 }

@@ -4,16 +4,19 @@ import { getConfig } from '$lib/config';
 import { getIngressUrl, getTtsState } from '$lib/snowflake';
 
 /**
- * Proxy text to the self-hosted Kokoro TTS service running in Snowpark
- * Container Services, streaming the audio straight back to the browser.
+ * Stream synthesized speech from the self-hosted Kokoro service running in
+ * Snowpark Container Services.
  *
- * If the service is cold, suspended, or errors for any reason, this returns
- * 503 with { fallback: true } so the client can drop back to the browser's
- * built-in speech synthesis instead of failing silently.
+ * Exposed over GET as well as POST specifically so the client can point an
+ * <audio> element straight at this URL: the browser then does native
+ * progressive playback and starts as soon as the first bytes arrive, instead
+ * of buffering the whole clip first. Over POST the caller has to read the
+ * body itself, which loses that.
+ *
+ * On any failure this returns 503 with { fallback: true } so the client can
+ * drop back to the browser's built-in speech synthesis.
  */
-export const POST: RequestHandler = async ({ request }) => {
-	const { text } = await request.json();
-
+async function synthesize(text: string): Promise<Response> {
 	if (!text || !text.trim()) {
 		return json({ error: 'No text provided' }, { status: 400 });
 	}
@@ -53,31 +56,29 @@ export const POST: RequestHandler = async ({ request }) => {
 			);
 		}
 
-		// Pipe the audio through as it is generated so playback can start
-		// before the whole clip is rendered.
-		const reader = upstream.body.getReader();
-		const stream = new ReadableStream({
-			async pull(controller) {
-				const { done, value } = await reader.read();
-				if (done) {
-					controller.close();
-					return;
-				}
-				controller.enqueue(value);
-			},
-			cancel() {
-				reader.cancel();
-			}
-		});
-
-		return new Response(stream, {
+		// Pass the body straight through. No Content-Length, so the browser
+		// treats it as a stream and begins playback on the first chunk.
+		return new Response(upstream.body, {
 			headers: {
 				'Content-Type': 'audio/mpeg',
-				'Cache-Control': 'no-cache'
+				'Cache-Control': 'no-cache',
+				// Vite's dev middleware will otherwise buffer the whole body
+				// before flushing, which defeats progressive playback.
+				'X-Accel-Buffering': 'no'
 			}
 		});
 	} catch (err) {
 		const detail = err instanceof Error ? err.message : 'Request failed';
 		return json({ fallback: true, state: 'UNAVAILABLE', detail }, { status: 503 });
 	}
+}
+
+/** Used by <audio src="..."> for progressive playback. */
+export const GET: RequestHandler = async ({ url }) => {
+	return synthesize(url.searchParams.get('text') ?? '');
+};
+
+export const POST: RequestHandler = async ({ request }) => {
+	const { text } = await request.json();
+	return synthesize(text);
 };

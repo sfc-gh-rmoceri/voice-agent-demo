@@ -87,17 +87,22 @@
 					: 'Tap the orb to speak, or type below'
 	);
 
-	onMount(async () => {
-		vegaEmbedModule = await import('vega-embed');
-		const mermaidMod = await import('mermaid');
-		mermaidMod.default.initialize({ startOnLoad: false, theme: 'dark' });
-		// Warm up voice list
-		window.speechSynthesis.getVoices();
-		refreshTtsStatus();
-
+	onMount(() => {
 		// Keep the engine badge honest — the service can come up or go down
-		// outside the app (npm run tts:up / tts:down, auto-suspend).
+		// outside the app (npm run tts:up / tts:down, auto-suspend). Registered
+		// synchronously: Svelte ignores a cleanup returned from an async
+		// onMount, which would leak this interval.
 		const bgPoll = setInterval(refreshTtsStatus, 30000);
+
+		(async () => {
+			vegaEmbedModule = await import('vega-embed');
+			const mermaidMod = await import('mermaid');
+			mermaidMod.default.initialize({ startOnLoad: false, theme: 'dark' });
+			// Warm up voice list
+			window.speechSynthesis.getVoices();
+			refreshTtsStatus();
+		})();
+
 		return () => clearInterval(bgPoll);
 	});
 
@@ -449,7 +454,12 @@
 	}
 
 	// ============ Speech synthesis ============
+	// Bumped on every new or cancelled utterance so an in-flight chunk queue
+	// knows it has been superseded and should drop its remaining clips.
+	let speakToken = 0;
+
 	function stopSpeaking() {
+		speakToken++;
 		window.speechSynthesis.cancel();
 		if (currentAudio) {
 			currentAudio.pause();
@@ -526,47 +536,100 @@
 		isSpeaking = true;
 		speakingIndex = index;
 
-		try {
-			const response = await fetch('/api/text-to-speech', {
-				method: 'POST',
-				headers: { 'Content-Type': 'application/json' },
-				body: JSON.stringify({ text: cleaned })
-			});
+		// Synthesis time scales with text length, and neither Vite nor
+		// adapter-node reliably forwards the upstream stream chunk-by-chunk. So
+		// instead of waiting on one big clip, split into sentence groups: the
+		// first is short enough to generate fast, and each later group is
+		// fetched while the previous one plays.
+		const chunks = splitForSpeech(cleaned);
+		const token = ++speakToken;
 
-			if (!response.ok) {
-				// Service went cold between the status check and now.
-				const body = await response.json().catch(() => ({}));
-				if (body.state) {
-					ttsState = body.state;
-					ttsDetail = body.detail || '';
+		try {
+			let pending = fetchSpeech(chunks[0]);
+
+			for (let i = 0; i < chunks.length; i++) {
+				const url = await pending;
+
+				// stopSpeaking() or a newer request superseded this one.
+				if (token !== speakToken) {
+					URL.revokeObjectURL(url);
+					return;
 				}
-				isSpeaking = false;
-				speakingIndex = -1;
-				speakWithBrowser(cleaned, index);
-				return;
+
+				// Kick off the next chunk now so it generates during playback.
+				pending = i + 1 < chunks.length ? fetchSpeech(chunks[i + 1]) : Promise.resolve('');
+
+				await playClip(url, token);
+				if (token !== speakToken) return;
 			}
 
-			const blob = await response.blob();
-			const url = URL.createObjectURL(blob);
-			currentAudio = new Audio(url);
-			currentAudio.onended = () => {
-				isSpeaking = false;
-				speakingIndex = -1;
-				currentAudio = null;
-				URL.revokeObjectURL(url);
-			};
-			currentAudio.onerror = () => {
-				isSpeaking = false;
-				speakingIndex = -1;
-				currentAudio = null;
-				URL.revokeObjectURL(url);
-			};
-			await currentAudio.play();
-		} catch {
 			isSpeaking = false;
 			speakingIndex = -1;
+			currentAudio = null;
+		} catch {
+			if (token !== speakToken) return;
+			isSpeaking = false;
+			speakingIndex = -1;
+			currentAudio = null;
+			refreshTtsStatus();
 			speakWithBrowser(cleaned, index);
 		}
+	}
+
+	/**
+	 * Group sentences into chunks. The first is deliberately small so audio
+	 * starts quickly; later ones are larger to keep the prosody natural and
+	 * avoid a request per sentence.
+	 */
+	function splitForSpeech(text: string): string[] {
+		const sentences = text.match(/[^.!?]+[.!?]*\s*/g) ?? [text];
+		const chunks: string[] = [];
+		let buf = '';
+
+		for (const sentence of sentences) {
+			buf += sentence;
+			const limit = chunks.length === 0 ? 90 : 260;
+			if (buf.length >= limit) {
+				chunks.push(buf.trim());
+				buf = '';
+			}
+		}
+		if (buf.trim()) chunks.push(buf.trim());
+		return chunks.length ? chunks : [text];
+	}
+
+	/** Fetch one chunk as an object URL. Throws so the caller can fall back. */
+	async function fetchSpeech(text: string): Promise<string> {
+		const res = await fetch('/api/text-to-speech', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ text })
+		});
+		if (!res.ok) throw new Error(`TTS ${res.status}`);
+		return URL.createObjectURL(await res.blob());
+	}
+
+	/** Play one clip to completion, resolving on end or error. */
+	function playClip(url: string, token: number): Promise<void> {
+		return new Promise((resolve) => {
+			const audio = new Audio(url);
+			currentAudio = audio;
+
+			const done = () => {
+				URL.revokeObjectURL(url);
+				resolve();
+			};
+			audio.onended = done;
+			audio.onerror = done;
+
+			audio.play().catch(done);
+
+			// If stopSpeaking() ran while we were setting up, honour it.
+			if (token !== speakToken) {
+				audio.pause();
+				done();
+			}
+		});
 	}
 
 	// ============ TTS service lifecycle ============
