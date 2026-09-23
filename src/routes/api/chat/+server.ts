@@ -4,8 +4,22 @@ import { getConfig } from '$lib/config';
 
 export const POST: RequestHandler = async ({ request }) => {
 	const config = getConfig();
-	const { account, token, database, schema, agent } = config.snowflake;
+	const { account, token } = config.snowflake;
 	const body = await request.json();
+
+	// The client may target any agent the role can see, so a single deployment
+	// can be pointed at different agents without redeploying. Fall back to the
+	// configured default when the client doesn't specify one.
+	const database = body.agent?.database || config.snowflake.database;
+	const schema = body.agent?.schema || config.snowflake.schema;
+	const agent = body.agent?.name || config.snowflake.agent;
+
+	if (!database || !schema || !agent) {
+		return json(
+			{ error: 'No agent selected and no default configured' },
+			{ status: 400 }
+		);
+	}
 
 	const messages = [
 		...body.history.map((msg: { role: string; content: string }) => ({

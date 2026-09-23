@@ -4,9 +4,13 @@ import { join } from 'path';
 interface SnowflakeConfig {
 	account: string;
 	token: string;
-	database: string;
-	schema: string;
-	agent: string;
+	/**
+	 * Default agent. All three are optional: when unset the app lists the
+	 * agents the role can see and lets the user pick one at runtime.
+	 */
+	database?: string;
+	schema?: string;
+	agent?: string;
 }
 
 interface ElevenLabsConfig {
@@ -29,9 +33,11 @@ export function getConfig(): AppConfig {
 			snowflake: {
 				account: env.SNOWFLAKE_ACCOUNT,
 				token: env.SNOWFLAKE_TOKEN,
-				database: env.SNOWFLAKE_DATABASE || 'INTERACTIVE_DEMO',
-				schema: env.SNOWFLAKE_SCHEMA || 'RETAIL',
-				agent: env.SNOWFLAKE_AGENT || 'RETAIL_ANALYTICS_AGENT'
+				// No defaults: guessing another account's objects would just
+				// produce a confusing 404 from the agent endpoint.
+				database: env.SNOWFLAKE_DATABASE,
+				schema: env.SNOWFLAKE_SCHEMA,
+				agent: env.SNOWFLAKE_AGENT
 			},
 			elevenlabs: {
 				api_key: env.ELEVENLABS_API_KEY || ''

@@ -2,9 +2,9 @@
   "snowflake": {
     "account": "your-account-identifier",
     "token": "your-personal-access-token",
-    "database": "INTERACTIVE_DEMO",
-    "schema": "RETAIL",
-    "agent": "RETAIL_ANALYTICS_AGENT"
+    "database": "",
+    "schema": "",
+    "agent": ""
   },
   "elevenlabs": {
     "api_key": "your-elevenlabs-api-key"

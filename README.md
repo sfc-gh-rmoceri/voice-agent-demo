@@ -1,12 +1,16 @@
 # Voice Agent Demo
 
-Talk to a Snowflake Cortex Agent with your voice or by typing. Built with SvelteKit, ElevenLabs Scribe (speech-to-text), and Snowflake App Runtime.
+Talk to any Snowflake Cortex Agent with your voice or by typing. Built with
+SvelteKit, ElevenLabs Scribe (speech-to-text), and Snowflake App Runtime.
+
+**Dataset-agnostic.** Point it at your own agent — it lists the agents your role
+can see, and brands itself from the one you pick (display name, description).
 
 ## Architecture
 
-Voice in via ElevenLabs Scribe, query via a Snowflake Cortex Agent over
-pre-aggregated retail data, voice out via self-hosted Kokoro TTS on Snowpark
-Container Services — with graceful fallback to browser speech.
+Voice in via ElevenLabs Scribe, query via any Snowflake Cortex Agent, voice out
+via self-hosted Kokoro TTS on Snowpark Container Services — with graceful
+fallback to browser speech.
 
 See **[ARCHITECTURE.md](ARCHITECTURE.md)** for the full design: component map,
 data flow, latency work, voice-activity detection, SPCS lifecycle gotchas, and
@@ -14,7 +18,7 @@ cost.
 
 ## Prerequisites
 
-- A Snowflake account with a deployed Cortex Agent (e.g. `RETAIL_ANALYTICS_AGENT`)
+- A Snowflake account with at least one Cortex Agent your role can see
 - A Snowflake Personal Access Token (PAT)
 - An ElevenLabs account (free tier works) and API key
 
@@ -46,15 +50,31 @@ cp config.example.json config.json
   "snowflake": {
     "account": "your-account-identifier",
     "token": "your-personal-access-token",
-    "database": "INTERACTIVE_DEMO",
-    "schema": "RETAIL",
-    "agent": "RETAIL_ANALYTICS_AGENT"
+    "database": "",
+    "schema": "",
+    "agent": ""
   },
   "elevenlabs": {
     "api_key": "your-elevenlabs-api-key"
   }
 }
 ```
+
+### Choosing an agent
+
+`database` / `schema` / `agent` are **optional**. Leave them blank and the app
+lists every Cortex Agent your role can see (`SHOW AGENTS IN ACCOUNT`) and asks
+you to pick one:
+
+- **One agent visible** — selected automatically.
+- **Several** — you get a picker on first load, and a *Switch agent* button in
+  the header afterwards. Switching clears the conversation, since history against
+  a different dataset is meaningless.
+- **Set explicitly** — that agent is preselected, and the picker is still
+  available.
+
+The UI takes its title and welcome text from the agent's own `display_name` and
+`COMMENT`, so a well-described agent needs no further configuration here.
 
 ### Getting an ElevenLabs API Key
 
@@ -97,11 +117,10 @@ snow app deploy
 
 Set environment variables for deployed mode (instead of config.json):
 
-- `SNOWFLAKE_ACCOUNT`
-- `SNOWFLAKE_TOKEN`
-- `SNOWFLAKE_DATABASE`
-- `SNOWFLAKE_SCHEMA`
-- `SNOWFLAKE_AGENT`
+- `SNOWFLAKE_ACCOUNT` (required)
+- `SNOWFLAKE_TOKEN` (required)
+- `SNOWFLAKE_DATABASE`, `SNOWFLAKE_SCHEMA`, `SNOWFLAKE_AGENT` (optional default
+  agent; omit to pick one in the app)
 - `ELEVENLABS_API_KEY`
 
 ## Voice Output: Kokoro TTS on Snowpark Container Services

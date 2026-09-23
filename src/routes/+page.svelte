@@ -89,6 +89,28 @@
 
 	let chatArea: HTMLDivElement;
 	let pinnedToBottom = $state(true);
+
+	// ============ Agent selection ============
+	interface AgentInfo {
+		id: string;
+		database: string;
+		schema: string;
+		name: string;
+		displayName: string;
+		description: string;
+	}
+
+	let agents = $state<AgentInfo[]>([]);
+	let selectedAgent = $state<AgentInfo | null>(null);
+	let agentError = $state('');
+	let agentsLoading = $state(true);
+	let showAgentPicker = $state(false);
+
+	// Brand the app from the chosen agent rather than hardcoding a dataset.
+	const appTitle = $derived(selectedAgent?.displayName || 'Voice Agent');
+	const appSubtitle = $derived(
+		selectedAgent ? `${selectedAgent.database}.${selectedAgent.schema}` : 'No agent selected'
+	);
 	let waveCanvas: HTMLCanvasElement;
 	let vegaEmbedModule: typeof import('vega-embed') | null = null;
 
@@ -122,11 +144,52 @@
 			: isSpeaking
 				? 'Tap to stop playback'
 				: chatLoading
-					? 'Querying 600M+ retail records'
+					? 'Thinking\u2026'
 					: handsFree
 						? 'Hands-free — just start talking'
 						: 'Tap the orb to speak, or type below'
 	);
+
+	async function loadAgents() {
+		agentsLoading = true;
+		agentError = '';
+		try {
+			const res = await fetch('/api/agents');
+			const data = await res.json();
+			agents = data.agents ?? [];
+
+			if (data.error) {
+				agentError = data.error;
+			} else if (agents.length === 0) {
+				agentError = 'No Cortex Agents visible to this role.';
+			}
+
+			// Prefer the configured default; otherwise auto-select when there is
+			// only one choice, and prompt when the choice is genuinely ambiguous.
+			const configured = agents.find((a) => a.id === data.configured);
+			if (configured) {
+				selectedAgent = configured;
+			} else if (agents.length === 1) {
+				selectedAgent = agents[0];
+			} else if (agents.length > 1) {
+				showAgentPicker = true;
+			}
+		} catch (err) {
+			agentError = err instanceof Error ? err.message : 'Could not load agents';
+		} finally {
+			agentsLoading = false;
+		}
+	}
+
+	function chooseAgent(agent: AgentInfo) {
+		if (agent.id !== selectedAgent?.id) {
+			// Conversation history is meaningless against a different dataset.
+			messages = [];
+			stopSpeaking();
+		}
+		selectedAgent = agent;
+		showAgentPicker = false;
+	}
 
 	onMount(() => {
 		// Keep the engine badge honest — the service can come up or go down
@@ -142,6 +205,7 @@
 			// Warm up voice list
 			window.speechSynthesis.getVoices();
 			refreshTtsStatus();
+			loadAgents();
 		})();
 
 		return () => {
@@ -321,7 +385,18 @@
 			const response = await fetch('/api/chat', {
 				method: 'POST',
 				headers: { 'Content-Type': 'application/json' },
-				body: JSON.stringify({ message: msg, history })
+				body: JSON.stringify({
+					message: msg,
+					history,
+					// Lets one deployment target any visible agent.
+					agent: selectedAgent
+						? {
+								database: selectedAgent.database,
+								schema: selectedAgent.schema,
+								name: selectedAgent.name
+							}
+						: undefined
+				})
 			});
 
 			if (!response.ok) {
@@ -989,13 +1064,19 @@
 </script>
 
 <svelte:head>
-	<title>Voice Agent — Retail Analytics</title>
+	<title>{appTitle} — Voice Agent</title>
 	<link rel="preconnect" href="https://fonts.googleapis.com" />
 	<link
 		href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap"
 		rel="stylesheet"
 	/>
 </svelte:head>
+
+<svelte:window
+	onkeydown={(e) => {
+		if (e.key === 'Escape' && showAgentPicker && selectedAgent) showAgentPicker = false;
+	}}
+/>
 
 <div class="app-container">
 	<!-- LEFT: Conversation -->
@@ -1013,34 +1094,62 @@
 				</svg>
 			</div>
 			<div class="header-text">
-				<h1>Voice Agent</h1>
-				<div class="subtitle">Retail Analytics &middot; 600M Records</div>
+				<h1>{appTitle}</h1>
+				<div class="subtitle">{appSubtitle}</div>
 			</div>
-			<div class="header-status">
-				<span class="status-dot"></span>
-				Cortex Agent
-			</div>
+			{#if agents.length > 1}
+				<button
+					class="header-status agent-switch"
+					onclick={() => (showAgentPicker = true)}
+					title="Switch agent"
+				>
+					<span class="status-dot"></span>
+					Switch agent
+				</button>
+			{:else}
+				<div class="header-status">
+					<span class="status-dot"></span>
+					Cortex Agent
+				</div>
+			{/if}
 		</header>
 
 		<div class="chat-area" bind:this={chatArea} onscroll={handleChatScroll}>
 			{#if messages.length === 0}
 				<div class="welcome">
 					<h2>Talk to your data</h2>
-					<p>
-						Ask anything about retail sales, products, customers, or dealers. Speak or type &mdash;
-						answers come back with charts, tables, and voice.
-					</p>
-					<div class="chips">
-						<button class="chip" onclick={() => sendMessage('What is total revenue by region?')}>
-							Revenue by region
-						</button>
-						<button class="chip" onclick={() => sendMessage('What are the top product categories by revenue?')}>
-							Top categories
-						</button>
-						<button class="chip" onclick={() => sendMessage('Show me monthly revenue trends')}>
-							Monthly trends
-						</button>
-					</div>
+					{#if agentsLoading}
+						<p>Loading agents&hellip;</p>
+					{:else if agentError && !selectedAgent}
+						<p class="welcome-error">{agentError}</p>
+						<p>
+							Check that your PAT's role can see at least one Cortex Agent, then
+							<button class="chip" onclick={loadAgents}>retry</button>
+						</p>
+					{:else if !selectedAgent}
+						<p>Pick an agent to get started.</p>
+						<div class="chips">
+							<button class="chip" onclick={() => (showAgentPicker = true)}>Choose agent</button>
+						</div>
+					{:else}
+						<p>
+							{selectedAgent.description ||
+								'Ask a question about this data. Speak or type \u2014 answers come back with charts, tables, and voice.'}
+						</p>
+						<!-- Starter prompts stay dataset-agnostic: the agent knows its own
+						     schema, so asking it is more useful than guessing domain terms. -->
+						<div class="chips">
+							<button class="chip" onclick={() => sendMessage('What data do you have access to?')}>
+								What data is here?
+							</button>
+							<button class="chip" onclick={() => sendMessage('What questions can you answer?')}>
+								What can you answer?
+							</button>
+							<button class="chip" onclick={() => sendMessage('Show me a chart of the most important trend in this data')}>
+								Show me a trend
+							</button>
+						</div>
+					{/if}
 				</div>
 			{/if}
 
@@ -1220,3 +1329,42 @@
 		</div>
 	</div>
 </div>
+
+{#if showAgentPicker}
+	<!-- Dismissable only when an agent is already selected, so first-run cannot
+	     leave the app with nothing to talk to. Backdrop clicks are detected by
+	     comparing target to currentTarget, which avoids putting a click handler
+	     on the dialog itself just to stop propagation. -->
+	<div
+		class="modal-backdrop"
+		role="presentation"
+		onclick={(e) => {
+			if (e.target === e.currentTarget && selectedAgent) showAgentPicker = false;
+		}}
+	>
+		<div class="modal" role="dialog" aria-modal="true" aria-label="Select an agent" tabindex="-1">
+			<h3>Select an agent</h3>
+			<p class="modal-hint">Any Cortex Agent your role can see.</p>
+
+			<div class="agent-list">
+				{#each agents as agent}
+					<button
+						class="agent-option"
+						class:selected={agent.id === selectedAgent?.id}
+						onclick={() => chooseAgent(agent)}
+					>
+						<div class="agent-name">{agent.displayName}</div>
+						<div class="agent-path">{agent.database}.{agent.schema}.{agent.name}</div>
+						{#if agent.description}
+							<div class="agent-desc">{agent.description}</div>
+						{/if}
+					</button>
+				{/each}
+			</div>
+
+			{#if selectedAgent}
+				<button class="modal-close" onclick={() => (showAgentPicker = false)}>Cancel</button>
+			{/if}
+		</div>
+	</div>
+{/if}

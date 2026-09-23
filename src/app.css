@@ -760,3 +760,114 @@ body::before {
 	.orb-core { width: 70px; height: 70px; }
 	.orb-icon { font-size: 22px; }
 }
+
+/* ============ Agent picker ============ */
+.modal-backdrop {
+	position: fixed;
+	inset: 0;
+	background: rgba(3, 6, 11, 0.78);
+	backdrop-filter: blur(6px);
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	z-index: 50;
+	padding: 24px;
+}
+
+.modal {
+	width: 100%;
+	max-width: 520px;
+	max-height: 80vh;
+	display: flex;
+	flex-direction: column;
+	background: var(--bg-panel, #0B1118);
+	border: 1px solid var(--border-subtle);
+	border-radius: 14px;
+	padding: 24px;
+	box-shadow: 0 24px 64px rgba(0, 0, 0, 0.6);
+}
+
+.modal h3 {
+	font-size: 16px;
+	font-weight: 600;
+	margin-bottom: 4px;
+}
+
+.modal-hint {
+	font-size: 12px;
+	color: var(--text-dim);
+	margin-bottom: 16px;
+}
+
+.agent-list {
+	display: flex;
+	flex-direction: column;
+	gap: 8px;
+	overflow-y: auto;
+	min-height: 0;
+}
+
+.agent-option {
+	text-align: left;
+	padding: 12px 14px;
+	background: rgba(255, 255, 255, 0.02);
+	border: 1px solid var(--border-subtle);
+	border-radius: 10px;
+	cursor: pointer;
+	transition: border-color 120ms ease, background 120ms ease;
+}
+
+.agent-option:hover {
+	background: rgba(41, 181, 232, 0.06);
+	border-color: rgba(41, 181, 232, 0.45);
+}
+
+.agent-option.selected {
+	border-color: rgba(41, 181, 232, 0.8);
+	background: rgba(41, 181, 232, 0.08);
+}
+
+.agent-name {
+	font-size: 13.5px;
+	font-weight: 600;
+	color: var(--text-primary);
+}
+
+.agent-path {
+	font-size: 11px;
+	color: var(--text-dim);
+	font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+	margin-top: 2px;
+}
+
+.agent-desc {
+	font-size: 11.5px;
+	color: var(--text-dim);
+	margin-top: 6px;
+	line-height: 1.45;
+}
+
+.modal-close {
+	margin-top: 16px;
+	align-self: flex-end;
+	padding: 8px 16px;
+	font-size: 12px;
+	color: var(--text-dim);
+	background: transparent;
+	border: 1px solid var(--border-subtle);
+	border-radius: 8px;
+	cursor: pointer;
+}
+
+.modal-close:hover {
+	color: var(--text-primary);
+}
+
+.agent-switch {
+	cursor: pointer;
+	font: inherit;
+}
+
+.welcome-error {
+	color: #ff8a8a;
+}

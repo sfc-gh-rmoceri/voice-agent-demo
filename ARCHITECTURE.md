@@ -1,9 +1,13 @@
 # Architecture
 
-A voice interface to a Snowflake Cortex Agent. You speak a question, it queries
-600M+ retail records, and it answers out loud.
+A voice interface to **any** Snowflake Cortex Agent. You speak a question, the
+agent queries your data, and it answers out loud.
 
 Everything except speech-to-text runs inside Snowflake.
+
+The app is dataset-agnostic: it discovers the agents a role can see and brands
+itself from the selected agent's own metadata. The retail figures referenced
+below are from the reference deployment, not a requirement.
 
 ---
 
@@ -18,16 +22,17 @@ flowchart TB
     subgraph SAR["SvelteKit server (adapter-node)"]
         STT["/api/speech-to-text"]
         CHAT["/api/chat"]
+        LIST["/api/agents"]
         TTS["/api/text-to-speech"]
         STATUS["/api/tts-status"]
         SF["lib/snowflake.ts<br/>SQL API + state cache"]
     end
 
     subgraph Snowflake
-        AGENT["Cortex Agent<br/>RETAIL_ANALYTICS_AGENT"]
-        SV["Semantic view<br/>RETAIL_FAST_SV"]
-        AGG["Aggregate tables<br/>AGG_* (7.5M rows)"]
-        RAW["SALES<br/>600M rows"]
+        AGENT["Cortex Agent<br/>(user-selected)"]
+        SV["Semantic view"]
+        AGG["Aggregate tables<br/>(reference deployment)"]
+        RAW["Raw fact table"]
         KOKORO["SPCS service<br/>KOKORO_TTS"]
         POOL["Compute pool<br/>VOICE_TTS_POOL"]
     end
@@ -35,7 +40,8 @@ flowchart TB
     EL["ElevenLabs<br/>Scribe v2"]
 
     UI -->|"webm audio"| STT --> EL
-    UI -->|"text + history"| CHAT -->|"SSE"| AGENT
+    UI -->|"text + history + agent"| CHAT -->|"SSE"| AGENT
+    UI -->|"discover"| LIST -->|"SHOW AGENTS"| AGENT
     AGENT --> SV --> AGG
     AGG -.->|"precomputed from"| RAW
     UI -->|"text chunks"| TTS --> KOKORO
@@ -60,6 +66,8 @@ the demo.
 | `src/routes/api/text-to-speech/+server.ts` | 84 | Proxy to Kokoro on SPCS, with fallback signalling |
 | `src/routes/api/chat/+server.ts` | 57 | Cortex Agent SSE proxy |
 | `src/lib/config.ts` | 49 | Env vars (deployed) → `config.json` (local) |
+| `src/lib/agents.ts` | 55 | Agent discovery via `SHOW AGENTS IN ACCOUNT` |
+| `src/routes/api/agents/+server.ts` | 29 | Agent list + configured default |
 | `src/routes/api/speech-to-text/+server.ts` | 34 | ElevenLabs Scribe v2 |
 | `src/routes/api/tts-status/+server.ts` | 34 | State reporting + resume/suspend |
 
@@ -78,7 +86,7 @@ The transcript is then sent through the normal chat path — voice and typed inp
 converge immediately, so there is only one query path to reason about.
 
 **This is the only component not inside Snowflake.** It is on the ElevenLabs free
-tier, which includes STT but *not* TTS (see §5.1).
+tier, which includes STT but *not* TTS (see §6.1).
 
 ### 3.2 Query
 
@@ -98,13 +106,39 @@ Without these you get duplicated charts and doubled prose.
 ### 3.3 Speech out
 
 Auto-speaks on every completed response. Text is cleaned of markdown, split into
-sentence groups, and played as a queue (see §4.1).
+sentence groups, and played as a queue (see §5.1).
 
 ---
 
-## 4. Design decisions worth knowing
+## 4. Agent selection
 
-### 4.1 Chunked TTS playback, not streaming
+`/api/agents` runs `SHOW AGENTS IN ACCOUNT` and returns each agent's fully
+qualified name plus presentation metadata. Agents carry their own `profile` JSON
+(`display_name`, `color`) and a `COMMENT`, so **the UI brands itself from the
+selected agent** rather than from per-deployment configuration.
+
+Selection rules: a configured default wins; otherwise a single visible agent is
+auto-selected; otherwise the user is prompted. Switching agents clears the
+conversation, because history against a different dataset is misleading rather
+than merely stale.
+
+The selected agent is sent with each `/api/chat` request and the server falls
+back to the configured default, so **one deployment can serve several agents**
+without redeploying.
+
+`database`/`schema`/`agent` config keys are optional and have **no defaults** —
+guessing another account's object names would only produce a confusing 404 from
+the agent endpoint.
+
+Starter prompts are deliberately dataset-agnostic ("What data do you have access
+to?") because the agent knows its own schema, which makes asking it more useful
+than guessing domain vocabulary.
+
+---
+
+## 5. Design decisions worth knowing
+
+### 5.1 Chunked TTS playback, not streaming
 
 **Time-to-first-audio was ~5.5s. It is now ~1.3s.** Three causes, in order of
 impact:
@@ -127,7 +161,7 @@ impact:
    `<audio src>` progressive playback and did not help; it is retained but is not
    the mechanism that fixed this.
 
-### 4.2 Voice activity detection
+### 5.2 Voice activity detection
 
 Two independent detectors, both reading RMS from `getByteTimeDomainData`:
 
@@ -159,7 +193,7 @@ Three constraints that are easy to get wrong:
 A live input meter with the threshold marked is rendered in the UI, because mic
 gain problems and threshold problems look identical from the outside.
 
-### 4.3 Query performance: pre-aggregation
+### 5.3 Query performance: pre-aggregation
 
 The agent originally queried `SALES` (600M rows, ~15 GB scans) and hit its
 response budget. `RETAIL_FAST_SV` reads five aggregate tables instead:
@@ -181,7 +215,7 @@ Semantic view constraints hit along the way: aliases after `AS` must match the
 source column name exactly; numeric columns must be `FACTS`, not `DIMENSIONS`;
 and metrics must be aggregated when selected through `SEMANTIC_VIEW()`.
 
-### 4.4 Self-hosted TTS on SPCS
+### 5.4 Self-hosted TTS on SPCS
 
 Kokoro-82M via Kokoro-FastAPI, exposing an OpenAI-compatible
 `/v1/audio/speech` on port 8880 with a readiness probe on `/health`.
@@ -189,7 +223,7 @@ Kokoro-82M via Kokoro-FastAPI, exposing an OpenAI-compatible
 **This is more expensive than the alternatives and that is a deliberate
 trade-off.** SPCS is ~1.1 credits/hr versus ElevenLabs at ~$0.22/hr or Azure free
 tier. It is justified by data locality and the all-in-Snowflake story, not
-economics. It exists because the ElevenLabs free tier blocks TTS entirely (§5.1)
+economics. It exists because the ElevenLabs free tier blocks TTS entirely (§6.1)
 and Azure signup rejected a work email.
 
 Lifecycle is explicit (`npm run tts:up` / `tts:down`) plus in-app controls,
@@ -197,15 +231,15 @@ because idle cost is real.
 
 ---
 
-## 5. Constraints and failure modes
+## 6. Constraints and failure modes
 
-### 5.1 ElevenLabs free tier has STT but not TTS
+### 6.1 ElevenLabs free tier has STT but not TTS
 
 TTS returns HTTP 402 `paid_plan_required` — "Free users cannot use library voices
 via the API", and `/v1/voices` returns empty. This is why TTS is self-hosted while
 STT is not.
 
-### 5.2 TTS degradation chain
+### 6.2 TTS degradation chain
 
 `Kokoro on SPCS` → `browser speechSynthesis` → silent text-only.
 
@@ -216,7 +250,7 @@ from a real failure. The engine badge reflects which is active.
 The client re-checks state before speaking and polls every 30s, because the
 service can be suspended out-of-band by `tts:down` or auto-suspend.
 
-### 5.3 SPCS gotchas
+### 6.3 SPCS gotchas
 
 - **`AUTO_SUSPEND_SECS` measures "no services and no jobs"** — a running service
   blocks it indefinitely. The pool will *not* auto-suspend just because nobody is
@@ -233,14 +267,14 @@ service can be suspended out-of-band by `tts:down` or auto-suspend.
   → model load. Treat anything other than `READY` as "fall back", not "wait".
 - **Ingress endpoints time out after 90s.**
 
-### 5.4 Auth
+### 6.4 Auth
 
 Two different header formats against the same account:
 
 - SQL API and Cortex Agent: `Authorization: Bearer <PAT>`
 - SPCS ingress: `Authorization: Snowflake Token="<PAT>"`
 
-### 5.5 Layout constraint
+### 6.5 Layout constraint
 
 `.conversation-pane` is a grid item, and grid items default to
 `min-height: auto`. Without an explicit `min-height: 0`, it stretches to fit its
@@ -251,7 +285,7 @@ a scroll container at all — `scrollHeight === clientHeight`, so setting
 
 ---
 
-## 6. Cost
+## 7. Cost
 
 | Component | Rate | Notes |
 |---|---|---|
@@ -264,19 +298,19 @@ when not demoing.
 
 ---
 
-## 7. Configuration
+## 8. Configuration
 
 `src/lib/config.ts` reads environment variables first, then falls back to
 `config.json`. Deployed via SAR the env vars are set; locally `config.json`
 (gitignored) holds them.
 
 Required: `SNOWFLAKE_ACCOUNT`, `SNOWFLAKE_TOKEN` (PAT), `ELEVENLABS_API_KEY`.
-Optional with defaults: `SNOWFLAKE_DATABASE` (`INTERACTIVE_DEMO`),
-`SNOWFLAKE_SCHEMA` (`RETAIL`), `SNOWFLAKE_AGENT` (`RETAIL_ANALYTICS_AGENT`).
+Optional: `SNOWFLAKE_DATABASE`, `SNOWFLAKE_SCHEMA`, `SNOWFLAKE_AGENT` — a default
+agent. Omit them and the user picks one at runtime (§4).
 
 ---
 
-## 8. Operations
+## 9. Operations
 
 ```bash
 npm run dev          # local dev server
