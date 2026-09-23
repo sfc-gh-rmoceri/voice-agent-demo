@@ -50,7 +50,13 @@ export async function querySnowflake(
 
 const SERVICE = 'VOICE_DEMO.TTS.KOKORO_TTS';
 const POOL = 'VOICE_TTS_POOL';
-const ROLE = 'VOICE_TTS_ROLE';
+
+/**
+ * The PAT is role-restricted, so we cannot request a different role on the
+ * SQL API call. VOICE_TTS_ROLE is granted to SYSADMIN instead, letting the
+ * PAT's role inherit the compute pool and service privileges.
+ */
+const ROLE = undefined;
 
 export type TtsState = 'READY' | 'STARTING' | 'SUSPENDED' | 'UNAVAILABLE';
 
