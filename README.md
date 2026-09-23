@@ -4,19 +4,13 @@ Talk to a Snowflake Cortex Agent with your voice or by typing. Built with Svelte
 
 ## Architecture
 
-```
-Browser                              SvelteKit Server                    External
-  |                                    |                                   |
-  |-- MediaRecorder (audio/webm) ---> /api/speech-to-text -------------> ElevenLabs Scribe v2
-  |<-- { text } ----------------------|                                   |
-  |                                    |                                   |
-  |-- { message, history } ----------> /api/chat (SSE proxy) ----------> Cortex Agent :run
-  |<-- SSE stream --------------------|                                   |
-```
+Voice in via ElevenLabs Scribe, query via a Snowflake Cortex Agent over
+pre-aggregated retail data, voice out via self-hosted Kokoro TTS on Snowpark
+Container Services — with graceful fallback to browser speech.
 
-- Voice input is recorded in the browser, sent to ElevenLabs for transcription, then the text is sent to the Cortex Agent
-- The Cortex Agent SSE stream is proxied through the server to keep the PAT secret
-- Charts (Vega-Lite) and tables from Cortex Analyst are rendered inline
+See **[ARCHITECTURE.md](ARCHITECTURE.md)** for the full design: component map,
+data flow, latency work, voice-activity detection, SPCS lifecycle gotchas, and
+cost.
 
 ## Prerequisites
 
