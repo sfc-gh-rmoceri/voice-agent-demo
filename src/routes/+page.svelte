@@ -82,6 +82,11 @@
 	/** Ignore the mic briefly after a turn so its tail cannot retrigger. */
 	const WAKE_COOLDOWN_MS = 700;
 
+	// Surfaced in the UI so it's visible whether the mic is actually feeding us
+	// audio, and how close the input is to tripping the threshold.
+	let micLevel = $state(0);
+	let wakeThreshold = $state(0.022);
+
 	let chatArea: HTMLDivElement;
 	let pinnedToBottom = $state(true);
 	let waveCanvas: HTMLCanvasElement;
@@ -468,6 +473,10 @@
 				audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
 			});
 			wakeContext = new AudioContext();
+			// Created after an await, so the user-gesture chain is broken and
+			// Chrome may hand us a suspended context that only ever reports
+			// silence. Resume explicitly.
+			if (wakeContext.state === 'suspended') await wakeContext.resume();
 			const source = wakeContext.createMediaStreamSource(wakeStream);
 			wakeAnalyser = wakeContext.createAnalyser();
 			wakeAnalyser.fftSize = 512;
@@ -503,8 +512,9 @@
 		if (!wakeAnalyser) return;
 
 		const samples = new Uint8Array(wakeAnalyser.fftSize);
-		let floor = 0;
-		let floorFrames = 0;
+		// Seed optimistically low: a silent room is the common case, and a floor
+		// that starts too high cannot trigger at all.
+		let floor = 0.004;
 		let loudSince: number | null = null;
 
 		const tick = () => {
@@ -515,6 +525,7 @@
 			const busy = isRecording || isSpeaking || chatLoading || isTranscribing;
 			if (busy || performance.now() < wakeCooldownUntil) {
 				loudSince = null;
+				micLevel = 0;
 				return;
 			}
 
@@ -526,15 +537,20 @@
 			}
 			const level = Math.sqrt(sum / samples.length);
 
-			// Track the room's quiet baseline continuously rather than once, so
-			// drifting background noise (HVAC, a projector fan) doesn't
-			// gradually turn into a false trigger.
-			if (floorFrames < 240 || level < floor * 1.5) {
-				floor = (floor * floorFrames + level) / (floorFrames + 1);
-				floorFrames = Math.min(floorFrames + 1, 240);
-			}
+			const threshold = Math.min(Math.max(floor * 4, 0.022), 0.07);
+			micLevel = level;
+			wakeThreshold = threshold;
 
-			const threshold = Math.min(Math.max(floor * 4, 0.03), 0.1);
+			// Only ever learn the floor from frames that are NOT speech, and let
+			// it fall fast but rise slowly. Learning unconditionally lets your
+			// own voice become the "ambient" baseline, which pushes the
+			// threshold above your speaking level and wedges detection off for
+			// good.
+			if (level < floor) {
+				floor = floor * 0.9 + level * 0.1;
+			} else if (level < threshold) {
+				floor = floor * 0.995 + level * 0.005;
+			}
 
 			if (level > threshold) {
 				loudSince ??= performance.now();
@@ -1146,6 +1162,15 @@
 				/>
 				<span>{handsFreeArming ? 'Enabling\u2026' : 'Hands-free'}</span>
 			</label>
+
+			{#if handsFree && !isRecording}
+				<!-- Live input meter: the marker is the trigger threshold, so if
+				     the bar never reaches it the mic gain is the problem. -->
+				<div class="mic-meter" title="Mic input level vs trigger threshold">
+					<div class="mic-meter-fill" style="width: {Math.min(micLevel / 0.15, 1) * 100}%"></div>
+					<div class="mic-meter-mark" style="left: {Math.min(wakeThreshold / 0.15, 1) * 100}%"></div>
+				</div>
+			{/if}
 		</div>
 
 		<div class="input-row">

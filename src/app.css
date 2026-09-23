@@ -529,6 +529,32 @@ body::before {
 	opacity: 0.5;
 }
 
+.mic-meter {
+	position: relative;
+	width: 160px;
+	height: 4px;
+	margin: 10px auto 0;
+	background: rgba(255, 255, 255, 0.08);
+	border-radius: 2px;
+	overflow: hidden;
+}
+
+.mic-meter-fill {
+	height: 100%;
+	background: linear-gradient(90deg, #29b5e8, #d45b90);
+	border-radius: 2px;
+	transition: width 60ms linear;
+}
+
+.mic-meter-mark {
+	position: absolute;
+	top: -2px;
+	width: 2px;
+	height: 8px;
+	background: rgba(255, 159, 54, 0.9);
+	border-radius: 1px;
+}
+
 /* Input row */
 .input-row {
 	width: 100%;
