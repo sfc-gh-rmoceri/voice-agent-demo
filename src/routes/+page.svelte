@@ -67,7 +67,23 @@
 	/** Absolute cap so a stuck mic cannot record forever. */
 	const MAX_RECORDING_MS = 30000;
 
+	// Hands-free — hold the mic open and start recording when speech is heard,
+	// so a follow-up question needs no click at all.
+	let handsFree = $state(false);
+	let handsFreeArming = $state(false);
+	let wakeStream: MediaStream | null = null;
+	let wakeContext: AudioContext | null = null;
+	let wakeAnalyser: AnalyserNode | null = null;
+	let wakeFrame: number | null = null;
+	let wakeCooldownUntil = 0;
+
+	/** Sustained level above threshold before we treat it as a real utterance. */
+	const WAKE_SUSTAIN_MS = 180;
+	/** Ignore the mic briefly after a turn so its tail cannot retrigger. */
+	const WAKE_COOLDOWN_MS = 700;
+
 	let chatArea: HTMLDivElement;
+	let pinnedToBottom = $state(true);
 	let waveCanvas: HTMLCanvasElement;
 	let vegaEmbedModule: typeof import('vega-embed') | null = null;
 
@@ -93,7 +109,7 @@
 
 	const statusHint = $derived(
 		isRecording
-			? autoStop
+			? autoStop || handsFree
 				? heardSpeech
 					? 'Listening — pause when you\u2019re done'
 					: 'Go ahead, I\u2019m listening'
@@ -102,7 +118,9 @@
 				? 'Tap to stop playback'
 				: chatLoading
 					? 'Querying 600M+ retail records'
-					: 'Tap the orb to speak, or type below'
+					: handsFree
+						? 'Hands-free — just start talking'
+						: 'Tap the orb to speak, or type below'
 	);
 
 	onMount(() => {
@@ -121,11 +139,30 @@
 			refreshTtsStatus();
 		})();
 
-		return () => clearInterval(bgPoll);
+		return () => {
+			clearInterval(bgPoll);
+			disarmHandsFree();
+		};
 	});
 
-	function scrollToBottom() {
-		if (chatArea) chatArea.scrollTop = chatArea.scrollHeight;
+	/**
+	 * Keep the newest content in view, unless the user has deliberately
+	 * scrolled up to read back — yanking them to the bottom mid-read on every
+	 * streamed token would be worse than not scrolling at all.
+	 */
+	function scrollToBottom(force = false) {
+		if (!chatArea) return;
+		if (!force && !pinnedToBottom) return;
+		chatArea.scrollTop = chatArea.scrollHeight;
+	}
+
+	/** Within this many px of the bottom still counts as "following along". */
+	const PIN_THRESHOLD_PX = 120;
+
+	function handleChatScroll() {
+		if (!chatArea) return;
+		const distance = chatArea.scrollHeight - chatArea.scrollTop - chatArea.clientHeight;
+		pinnedToBottom = distance <= PIN_THRESHOLD_PX;
 	}
 
 	// ============ Live waveform ============
@@ -268,7 +305,7 @@
 		const assistantIdx = messages.length - 1;
 
 		await tick();
-		scrollToBottom();
+		scrollToBottom(true);
 
 		const history = messages
 			.slice(0, -2)
@@ -400,7 +437,7 @@
 			await tick();
 			await renderMermaid();
 			await renderCharts();
-			scrollToBottom();
+			scrollToBottom(true);
 
 			if (autoSpeak && assistantMsg.content) {
 				speakText(assistantMsg.content, assistantIdx);
@@ -412,6 +449,116 @@
 		} finally {
 			chatLoading = false;
 		}
+	}
+
+	// ============ Hands-free wake listening ============
+	/**
+	 * Hold the mic open and start recording when the user begins talking.
+	 *
+	 * Uses its own AudioContext and analyser so that starting/stopping a
+	 * recording (which tears down the waveform context) never disturbs the
+	 * always-on listener. The underlying MediaStream is shared with the
+	 * recorder, so enabling this prompts for mic permission exactly once.
+	 */
+	async function armHandsFree(): Promise<boolean> {
+		if (wakeStream) return true;
+		handsFreeArming = true;
+		try {
+			wakeStream = await navigator.mediaDevices.getUserMedia({
+				audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+			});
+			wakeContext = new AudioContext();
+			const source = wakeContext.createMediaStreamSource(wakeStream);
+			wakeAnalyser = wakeContext.createAnalyser();
+			wakeAnalyser.fftSize = 512;
+			source.connect(wakeAnalyser);
+			watchForSpeech();
+			return true;
+		} catch {
+			disarmHandsFree();
+			handsFree = false;
+			return false;
+		} finally {
+			handsFreeArming = false;
+		}
+	}
+
+	function disarmHandsFree() {
+		if (wakeFrame) {
+			cancelAnimationFrame(wakeFrame);
+			wakeFrame = null;
+		}
+		wakeAnalyser = null;
+		if (wakeContext) {
+			wakeContext.close();
+			wakeContext = null;
+		}
+		if (wakeStream) {
+			wakeStream.getTracks().forEach((t) => t.stop());
+			wakeStream = null;
+		}
+	}
+
+	function watchForSpeech() {
+		if (!wakeAnalyser) return;
+
+		const samples = new Uint8Array(wakeAnalyser.fftSize);
+		let floor = 0;
+		let floorFrames = 0;
+		let loudSince: number | null = null;
+
+		const tick = () => {
+			if (!wakeAnalyser || !handsFree) return;
+			wakeFrame = requestAnimationFrame(tick);
+
+			// Don't listen to ourselves, and don't interrupt an in-flight turn.
+			const busy = isRecording || isSpeaking || chatLoading || isTranscribing;
+			if (busy || performance.now() < wakeCooldownUntil) {
+				loudSince = null;
+				return;
+			}
+
+			wakeAnalyser.getByteTimeDomainData(samples);
+			let sum = 0;
+			for (let i = 0; i < samples.length; i++) {
+				const v = (samples[i] - 128) / 128;
+				sum += v * v;
+			}
+			const level = Math.sqrt(sum / samples.length);
+
+			// Track the room's quiet baseline continuously rather than once, so
+			// drifting background noise (HVAC, a projector fan) doesn't
+			// gradually turn into a false trigger.
+			if (floorFrames < 240 || level < floor * 1.5) {
+				floor = (floor * floorFrames + level) / (floorFrames + 1);
+				floorFrames = Math.min(floorFrames + 1, 240);
+			}
+
+			const threshold = Math.min(Math.max(floor * 4, 0.03), 0.1);
+
+			if (level > threshold) {
+				loudSince ??= performance.now();
+				if (performance.now() - loudSince >= WAKE_SUSTAIN_MS) {
+					loudSince = null;
+					startRecording();
+				}
+			} else {
+				loudSince = null;
+			}
+		};
+
+		tick();
+	}
+
+	async function toggleHandsFree() {
+		if (handsFree) {
+			handsFree = false;
+			disarmHandsFree();
+			return;
+		}
+		handsFree = true;
+		const ok = await armHandsFree();
+		if (!ok) handsFree = false;
 	}
 
 	// ============ Recording ============
@@ -484,17 +631,24 @@
 	}
 
 	async function startRecording() {
+		if (isRecording) return;
 		try {
 			// Don't record the assistant talking back to us.
 			stopSpeaking();
 
-			const stream = await navigator.mediaDevices.getUserMedia({
-				audio: {
-					echoCancellation: true,
-					noiseSuppression: true,
-					autoGainControl: true
-				}
-			});
+			// In hands-free mode the wake listener already owns a live stream;
+			// reuse it so we neither re-prompt for permission nor cut the
+			// listener off when this recording ends.
+			const ownsStream = !wakeStream;
+			const stream =
+				wakeStream ??
+				(await navigator.mediaDevices.getUserMedia({
+					audio: {
+						echoCancellation: true,
+						noiseSuppression: true,
+						autoGainControl: true
+					}
+				}));
 
 			// Set up live audio analysis
 			audioContext = new AudioContext();
@@ -513,14 +667,19 @@
 			};
 
 			mediaRecorder.onstop = async () => {
-				stream.getTracks().forEach((t) => t.stop());
+				// Only tear the stream down if this recording opened it.
+				if (ownsStream) stream.getTracks().forEach((t) => t.stop());
 				stopWaveform();
+				// Let the tail of the utterance die down before the wake
+				// listener is allowed to trigger again.
+				wakeCooldownUntil = performance.now() + WAKE_COOLDOWN_MS;
 				// A silent take has nothing worth sending to the transcriber.
 				if (discardTake) {
 					audioChunks = [];
 					return;
 				}
 				await processRecording();
+				wakeCooldownUntil = performance.now() + WAKE_COOLDOWN_MS;
 			};
 
 			mediaRecorder.start();
@@ -528,7 +687,9 @@
 			heardSpeech = false;
 			await tick();
 			drawWaveform();
-			if (autoStop) monitorSilence();
+			// Hands-free has no click to end a turn, so silence detection is
+			// mandatory there regardless of the toggle.
+			if (autoStop || handsFree) monitorSilence();
 		} catch {
 			stopWaveform();
 		}
@@ -845,7 +1006,7 @@
 			</div>
 		</header>
 
-		<div class="chat-area" bind:this={chatArea}>
+		<div class="chat-area" bind:this={chatArea} onscroll={handleChatScroll}>
 			{#if messages.length === 0}
 				<div class="welcome">
 					<h2>Talk to your data</h2>
@@ -937,6 +1098,12 @@
 				</div>
 			{/each}
 		</div>
+
+		{#if !pinnedToBottom && messages.length > 0}
+			<button class="jump-latest" onclick={() => scrollToBottom(true)}>
+				{'\u2193'} Jump to latest
+			</button>
+		{/if}
 	</div>
 
 	<!-- RIGHT: Voice orb -->
@@ -967,8 +1134,17 @@
 			<div class="label">{statusLabel}</div>
 			<div class="hint">{statusHint}</div>
 			<label class="auto-stop" title="End the turn automatically on a pause">
-				<input type="checkbox" bind:checked={autoStop} disabled={isRecording} />
+				<input type="checkbox" bind:checked={autoStop} disabled={isRecording || handsFree} />
 				<span>Auto-stop on silence</span>
+			</label>
+			<label class="auto-stop" title="Keep the mic open and start recording when you speak">
+				<input
+					type="checkbox"
+					checked={handsFree}
+					disabled={handsFreeArming || isRecording}
+					onchange={toggleHandsFree}
+				/>
+				<span>{handsFreeArming ? 'Enabling\u2026' : 'Hands-free'}</span>
 			</label>
 		</div>
 

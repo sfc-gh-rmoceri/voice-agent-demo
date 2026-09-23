@@ -61,6 +61,34 @@ body::before {
 	flex-direction: column;
 	border-right: 1px solid var(--border-subtle);
 	min-width: 0;
+	/* Grid items default to min-height:auto, which lets this stretch past the
+	   100vh row to fit its content. Without this the chat area never becomes a
+	   scroll container and autoscroll silently does nothing. */
+	min-height: 0;
+	overflow: hidden;
+	position: relative;
+}
+
+.jump-latest {
+	position: absolute;
+	bottom: 18px;
+	left: 50%;
+	transform: translateX(-50%);
+	padding: 7px 14px;
+	font-size: 11.5px;
+	font-weight: 500;
+	color: var(--text-primary);
+	background: rgba(20, 28, 40, 0.92);
+	border: 1px solid var(--border-subtle);
+	border-radius: 999px;
+	cursor: pointer;
+	backdrop-filter: blur(8px);
+	box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+	z-index: 5;
+}
+
+.jump-latest:hover {
+	border-color: rgba(41, 181, 232, 0.5);
 }
 
 .app-header {
@@ -115,7 +143,9 @@ body::before {
 
 .chat-area {
 	flex: 1;
+	min-height: 0;
 	overflow-y: auto;
+	overscroll-behavior: contain;
 	padding: 28px;
 	display: flex;
 	flex-direction: column;
