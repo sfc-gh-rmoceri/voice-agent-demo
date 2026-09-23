@@ -39,7 +39,16 @@ GRANT USAGE ON SCHEMA VOICE_DEMO.TTS TO ROLE VOICE_TTS_ROLE;
 GRANT CREATE SERVICE ON SCHEMA VOICE_DEMO.TTS TO ROLE VOICE_TTS_ROLE;
 GRANT READ, WRITE ON IMAGE REPOSITORY VOICE_DEMO.TTS.IMAGES TO ROLE VOICE_TTS_ROLE;
 
-GRANT ROLE VOICE_TTS_ROLE TO USER RMOCERI;
+-- Grant to whoever is running this, rather than a hardcoded user.
+SET setup_user = CURRENT_USER();
+GRANT ROLE VOICE_TTS_ROLE TO USER IDENTIFIER($setup_user);
+
+-- A role-restricted PAT cannot request a different role on the SQL API call, so
+-- the app cannot simply "USE ROLE VOICE_TTS_ROLE". Granting this role to
+-- SYSADMIN lets the PAT's own role inherit the compute pool and service
+-- privileges. Without this the app reports "Compute pool not found" even though
+-- the pool exists.
+GRANT ROLE VOICE_TTS_ROLE TO ROLE SYSADMIN;
 
 -- Confirm
 SHOW COMPUTE POOLS LIKE 'VOICE_TTS_POOL';

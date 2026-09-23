@@ -66,19 +66,33 @@ cp config.example.json config.json
 
 Generate a PAT in Snowsight under your user menu, or via CLI.
 
+### Snowflake CLI connection
+
+The `tts:*` scripts shell out to `snow`, and use your **default** connection. To
+point them at a specific one:
+
+```bash
+export SNOWFLAKE_DEFAULT_CONNECTION_NAME=my_connection
+```
+
 ## Run Locally
 
 ```bash
 npm run dev
 ```
 
-Open [http://localhost:5173](http://localhost:5173). Click the microphone button to record, or type a question.
+Open [http://localhost:5173](http://localhost:5173). Click the orb to record, or
+type a question.
+
+The app is fully usable at this point — it falls back to the browser's built-in
+speech synthesis for the spoken replies. The self-hosted TTS in the next section
+is optional and sounds considerably better.
 
 ## Deploy to Snowflake App Runtime
 
 ```bash
 snow app setup
-snow app deploy -c sfsenorthamerica-rmoceri_awse1
+snow app deploy
 ```
 
 Set environment variables for deployed mode (instead of config.json):
